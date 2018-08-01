@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+
+if [ ! $(command -v docker) ]; then
+  echo "Docker not found, you must install it to use docker-shunt"
+  exit 1
+fi
+
+usage(){
+  echo "Docker Registry Shunter"
+  echo "Required Flags:"
+  echo "-s source registry"
+  echo "-d destination registry"
+  echo "-i image name"
+  echo "-t tag name"
+  echo
+  echo "Optional Flags:"
+  echo "-h help"
+  echo "-l verbose log file, full output will be appended here"
+  echo "-c complete log file, on success only the image:image-tag string will be appended here"
+}
+
+# get opts
+while getopts "hs:d:i:t:l:c:" opt; do
+  case ${opt} in
+    h)
+      usage
+      exit 0
+      ;;
+    s)
+      SOURCE_REG=$OPTARG
+      ;;
+    d)
+      DEST_REG=$OPTARG
+      ;;
+    i)
+      IMAGE_NAME=$OPTARG
+      ;;
+    t)
+      IMAGE_TAG=$OPTARG
+      ;;
+    l)
+      DEBUG_LOG=$OPTARG
+      ;;
+    c)
+      COMPLETED_LOG=$OPTARG
+      ;;
+    default)
+      usage
+      exit 1
+    ;;
+  esac
+done
+
+if [ -z "${SOURCE_REG}" ]; then
+  echo
+  echo "ERROR: Missing required flag: -s source registry"
+  echo
+  usage
+  exit 1
+fi
+
+if [ -z "${DEST_REG}" ]; then
+  echo
+  echo "ERROR: Missing required flag: -d destination registry"
+  echo
+  usage
+  exit 1
+fi
+
+
+if [ -z "${DEBUG_LOG}" ]; then
+  DEBUG_LOG="/dev/stdout"
+fi
+
+if [ -z "${COMPLETED_LOG}" ]; then
+  COMPLETED_LOG="/dev/null"
+fi
+
+pull_path="${SOURCE_REG}/${IMAGE_NAME}:${IMAGE_TAG}"
+push_path="${DEST_REG}/${IMAGE_NAME}:${IMAGE_TAG}"
+
+echo "Migrating from ${pull_path} to ${push_path}" >> ${DEBUG_LOG}
+
+echo "Pulling from ${pull_path}" >> ${DEBUG_LOG}
+docker pull ${pull_path} 2>&1 >> ${DEBUG_LOG}
+
+echo "Tagging ${pull_path} as ${push_path}" >> ${DEBUG_LOG}
+docker tag ${pull_path} ${push_path} 2>&1 >> ${DEBUG_LOG}
+
+echo "Pushing ${push_path}" >>  ${DEBUG_LOG}
+docker push ${push_path} 2>&1 >> ${DEBUG_LOG}
+
+echo "${IMAGE_NAME}:${IMAGE_TAG}" >> ${COMPLETED_LOG}
+echo "${IMAGE_NAME}:${IMAGE_TAG} finished at $(date +%F%T)" >> ${DEBUG_LOG}

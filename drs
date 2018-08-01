@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+
+YARDMASTER_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+: "${REGISTRY_PROTOCOL:=https}"
+: "${DRY_RUN:=false}"
+
+# Catalog endpoint has pagination behavior. Which is not yet
+# supported by this script since our registry is small enough
+# to just feed a ridiculous "next number of items"
+# parameter and get everything listed out in one request
+: "${MAX_CATALOG_SIZE:=1000}"
+
+: "${TAG_PATTERN:="v[0-9].*"}"
+: "${IMAGE_PATTERN:=".*"}"
+
+# The -V option is only available on gnusort and not
+# supported on OS X or windows with native sort
+: "${SORT_ARGS:=-Vr}"
+
+job_start_time="$(date +%Y-%m-%d-%H-%M-%S)"
+
+usage(){
+  echo "Docker Registry Shunter: Yardmaster"
+  echo "Used for moving lots of images and tags at once"
+  echo "Required Flags:"
+  echo "-s source registry"
+  echo "-d destination registry"
+  echo
+  echo "Optional Flags:"
+  echo "-h help"
+  echo "-n maximum number of tags to move for each image (default: 5)"
+  echo "-w number of workers, this is roughly how many tasks will run in parallel (default: 10)"
+  echo "-e exclude file, newline delimited list of image:tag items to skip (default:drs-excluded)"
+  echo "-l verbose log file, full output will be appended here (default: drs-log-DATETIME)"
+  echo "-c complete log file, on success only the image:image-tag string will be appended here (default: drs-completed-DATETIME)"
+  echo
+  echo "Set the DRY_RUN environment variable to only list what would happen but not actually move anything (default: false)"
+  echo "Set the MAX_CATALOG_SIZE environment variable to pull more images from the source's catalog endpoint (default: 1000)"
+  echo "Set the TAG_PATTERN environment variable so we can grep only relevant tags for each image (default: v[0-9].*)"
+  echo "Set the SORT_ARGS environment variable to change how this script will sort the tag list (default: -Vr)"
+}
+
+# get opts
+while getopts "hs:d:n:e:l:c:w:" opt; do
+  case ${opt} in
+    h)
+      usage
+      exit 0
+      ;;
+    s)
+      SOURCE_REG=${OPTARG}
+      ;;
+    d)
+      DEST_REG=${OPTARG}
+      ;;
+    n)
+      MAX_TAG_COUNT=${OPTARG}
+      ;;
+    w)
+      WORKERS=${OPTARG}
+      ;;
+    e)
+      EXCLUDE_FILE=${OPTARG}
+      ;;
+    l)
+      DEBUG_LOG=${OPTARG}
+      ;;
+    c)
+      COMPLETED_LOG=${OPTARG}
+      ;;
+    default)
+      usage
+      exit 1
+    ;;
+  esac
+done
+
+if [ -z "${SOURCE_REG}" ]; then
+  echo
+  echo "ERROR: Missing required flag: -s source registry"
+  echo
+  usage
+  exit 1
+fi
+
+if [ -z "${DEST_REG}" ]; then
+  echo
+  echo "ERROR: Missing required flag: -d destination registry"
+  echo
+  usage
+  exit 1
+fi
+
+if [ -z "${MAX_TAG_COUNT}" ]; then
+  MAX_TAG_COUNT=5
+fi
+
+if [ -z "${WORKERS}" ]; then
+  WORKERS=10
+fi
+
+if [ -z "${EXCLUDE_FILE}" ]; then
+  EXCLUDE_FILE="/dev/null"
+fi
+
+if [ -z "${DEBUG_LOG}" ]; then
+  DEBUG_LOG="drs-log-${job_start_time}"
+fi
+
+if [ -z "${COMPLETED_LOG}" ]; then
+  COMPLETED_LOG="drs-completed-${job_start_time}"
+fi
+
+worker_script="docker-shunt"
+
+if [ ! $(command -v docker-shunt) ]; then
+  worker_script="${YARDMASTER_DIR}/${worker_script}"
+  if [ ! -f ${worker_script} ]; then
+    echo "ERROR: Can't find docker-shunt command in path, or next to this script."
+    exit 1
+  fi
+fi
+
+echo "Shunting discoverable images from ${SOURCE_REG} to ${DEST_REG}..." | tee -a ${DEBUG_LOG}
+echo "Requesting ${MAX_CATALOG_SIZE} images from the the source's catalog endpoint" | tee -a ${DEBUG_LOG}
+echo "Will shunt a max of ${MAX_TAG_COUNT} tags for each image" | tee -a ${DEBUG_LOG}
+echo "Will shunt ${WORKERS} tags at the same time" | tee -a ${DEBUG_LOG}
+
+shunt(){
+  echo "Shunting ${image}:${image_tag}"
+  if [ "${DRY_RUN}" == "true" ]; then
+    echo "${image}:${image_tag}" >> ${COMPLETED_LOG}
+  else
+    ${worker_script} -s ${SOURCE_REG} -d ${DEST_REG} -i ${image} -t ${image_tag} -l ${DEBUG_LOG} -c ${COMPLETED_LOG} &
+  fi
+}
+
+in_progress_count(){
+  echo $(ps aux | grep -v grep | grep ${worker_script} | wc -l)
+}
+
+waiting=false
+images=$(curl ${REGISTRY_PROTOCOL}://${SOURCE_REG}/v2/_catalog?n=${MAX_CATALOG_SIZE} 2>/dev/null | jq -r .repositories[] | grep -x ${IMAGE_PATTERN})
+
+if [ -z "${images}" ]; then
+  echo "No images found in the catalog of ${SOURCE_REG}"
+  echo "Nothing to migrate."
+  exit 1
+fi
+
+for image in ${images}; do
+  tag_count=0
+  image_tags=$(curl ${REGISTRY_PROTOCOL}://${SOURCE_REG}/v2/${image}/tags/list 2>/dev/null | jq -r .tags[] | grep -x ${TAG_PATTERN} | sort ${SORT_ARGS} | head -n ${MAX_TAG_COUNT})
+  # Using a while loop instead of a for-in gives us the 'continue' behavior we need
+  # Continues inside for loops in Bash do not resume at the top
+  printf "%s\n" "$image_tags" | while read -r image_tag; do
+    if [ -z "${image_tag}" ]; then
+      echo "Problem parsing empty image tag for ${image}, skipping"
+      continue
+    fi
+
+    if [ ! -z "$(grep ${image}:${image_tag} ${EXCLUDE_FILE})" ]; then
+      echo "Skipping ${image}:${image_tag}, already migrated" | tee -a ${DEBUG_LOG}
+      echo "${image}:${image_tag}" >> ${COMPLETED_LOG}
+      continue
+    fi
+
+    tasks_in_flight=$(in_progress_count)
+
+    while [ ! -z "${tasks_in_flight}" ] && [ "${tasks_in_flight}" -ge "${WORKERS}" ]; do
+      if [ "${waiting}" == "false" ]; then
+        echo "Already shunting $tasks_in_flight tags, waiting for some to finish before starting the next one"
+      fi
+      waiting=true
+      sleep 3
+      tasks_in_flight=$(in_progress_count)
+    done
+
+    waiting=false
+    shunt
+  done
+
+done;
